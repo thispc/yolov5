@@ -1,4 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics YOLOv5 🚀, AGPL-3.0 license
 """
 Train a YOLOv5 model on a custom dataset. Models and datasets download automatically from the latest YOLOv5 release.
 
@@ -13,7 +13,12 @@ Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
-
+try:
+    from clearml import Dataset, Task
+    CLEARML_AVAILABLE = True
+except ImportError:
+    CLEARML_AVAILABLE = False
+import glob
 import argparse
 import math
 import os
@@ -37,6 +42,25 @@ import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+
+import yaml
+
+def update_yaml_paths(yaml_path, dataset_root):
+    """
+    Updates the dataset.yaml paths to the correct extracted dataset location.
+    """
+    with open(yaml_path, "r") as f:
+        data_yaml = yaml.safe_load(f)
+
+    # Update paths dynamically
+    data_yaml["train"] = str(Path(dataset_root) / "turkey_ins_seg/data/train")
+    data_yaml["val"] = str(Path(dataset_root) / "turkey_ins_seg/data/val")
+
+    # Save the updated YAML
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data_yaml, f, default_flow_style=False)
+
+    print(f"✅ Updated dataset.yaml with correct paths: {yaml_path}")
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -149,6 +173,46 @@ def train(hyp, opt, device, callbacks):
         opt.workers,
         opt.freeze,
     )
+    task = None
+    if opt.clearml_dataset:
+        try:
+            print(f"📡 Connecting to ClearML...")
+            
+            task = Task.init(
+                project_name="YOLOv5 Training",  # Project Name
+                task_name=f"Training-{opt.clearml_dataset}",  # Task Name
+                task_type=Task.TaskTypes.training
+            )
+
+            print(f"🔗 Task initialized: {task.id}")
+
+            # Fetch ClearML dataset
+            print(f"📡 Fetching dataset '{opt.clearml_dataset}' from ClearML...")
+            dataset = Dataset.get(dataset_name=opt.clearml_dataset, dataset_project="ML Experiments")
+            local_dataset_path = dataset.get_local_copy()
+            print(f"✅ Dataset available at: {local_dataset_path}")
+
+            # Find YAML file dynamically
+            yaml_files = glob.glob(os.path.join(local_dataset_path, "*.yaml"))
+            if not yaml_files:
+                raise FileNotFoundError(f"⚠️ No YAML file found in: {local_dataset_path}")
+
+            dataset_yaml_path = yaml_files[0]
+            print(f"📄 Using dataset config: {dataset_yaml_path}")
+            opt.data = dataset_yaml_path  # Override opt.data with the found YAML
+
+            # Log dataset information in ClearML
+            task.connect_configuration(name="Dataset YAML", configuration=dataset_yaml_path)
+
+        except Exception as e:
+            raise str(e)
+
+    # Fallback to default dataset selection if no ClearML dataset is provided
+    else:
+        opt.data = check_file(opt.data)
+
+    # Proceed with normal dataset checking
+    data_dict = check_dataset(opt.data)
     callbacks.run("on_pretrain_routine_start")
 
     # Directories
@@ -167,6 +231,8 @@ def train(hyp, opt, device, callbacks):
     if not evolve:
         yaml_save(save_dir / "hyp.yaml", hyp)
         yaml_save(save_dir / "opt.yaml", vars(opt))
+
+    task.connect(vars(opt))
 
     # Loggers
     data_dict = None
@@ -357,10 +423,10 @@ def train(hyp, opt, device, callbacks):
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
     LOGGER.info(
-        f"Image sizes {imgsz} train, {imgsz} val\n"
-        f"Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
+        f'Image sizes {imgsz} train, {imgsz} val\n'
+        f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
         f"Logging results to {colorstr('bold', save_dir)}\n"
-        f"Starting training for {epochs} epochs..."
+        f'Starting training for {epochs} epochs...'
     )
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run("on_train_epoch_start")
@@ -434,7 +500,7 @@ def train(hyp, opt, device, callbacks):
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+                mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
                     % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
@@ -536,6 +602,9 @@ def train(hyp, opt, device, callbacks):
                         callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
         callbacks.run("on_train_end", last, best, epoch, results)
+    if task:
+        print(f"✅ Closing ClearML Task {task.id}")
+        task.close()
 
     torch.cuda.empty_cache()
     return results
@@ -564,6 +633,13 @@ def parse_opt(known=False):
         - Tutorial: https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
     """
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--clearml-dataset",
+        type=str,
+        default=None,  # Backward-compatible (defaults to None)
+        help="Specify ClearML dataset name. If not provided, uses local dataset.",
+    )
+    parser.add_argument("--dataset_version", type=str, default="latest", help="Specify dataset version")
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
@@ -880,9 +956,9 @@ def main(opt, callbacks=Callbacks()):
         # Plot results
         plot_evolve(evolve_csv)
         LOGGER.info(
-            f"Hyperparameter evolution finished {opt.evolve} generations\n"
+            f'Hyperparameter evolution finished {opt.evolve} generations\n'
             f"Results saved to {colorstr('bold', save_dir)}\n"
-            f"Usage example: $ python train.py --hyp {evolve_yaml}"
+            f'Usage example: $ python train.py --hyp {evolve_yaml}'
         )
 
 
